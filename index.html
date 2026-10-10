@@ -99,6 +99,7 @@ input[type=range]{width:100%;accent-color:var(--c2)}
       <button data-style="ring" aria-pressed="true">Ring</button>
       <button data-style="cell" aria-pressed="false">Cell</button>
       <button data-style="bold" aria-pressed="false">Bold</button>
+      <button data-style="horizontal" aria-pressed="false">Horizontal</button>
     </div>
     <div class="prev">
       <div><img id="p64" width="64" height="64" alt=""><span>Preview</span></div>
@@ -109,9 +110,11 @@ input[type=range]{width:100%;accent-color:var(--c2)}
 
   <p class="note">Pin this tab and leave it open. The icon and tab title follow your battery live.</p>
   <p class="note" id="diag"></p>
+  <p class="note" id="ver"></p>
 </main>
 
 <script>
+const VERSION = '1.1.0';
 const $ = id => document.getElementById(id);
 let favicon = $('favicon');
 const SWAP_LINK = /firefox/i.test(navigator.userAgent); // Firefox needs a fresh <link> to repaint
@@ -123,7 +126,10 @@ canvas.width = canvas.height = 64;
 const ctx = canvas.getContext('2d');
 let style = 'ring', last = {level: null, charging: false};
 
+const STYLES = ['ring', 'cell', 'bold', 'horizontal'];
 try { style = localStorage.getItem('bt-style') || 'ring'; } catch (e) {}
+if (!STYLES.includes(style)) style = 'ring';
+$('ver').textContent = 'BatteryTab v' + VERSION;
 
 function palette(p) {
   if (p <= 20) return ['#ff4d6d', '#ff2e93'];
@@ -150,14 +156,18 @@ function bolt(cx, cy, s, fill) {
   ctx.fill();
 }
 
-function label(p, color, size) {
-  ctx.fillStyle = color;
+function label(p, color, size, outline, y = 34) {
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  const s = String(p);
-  const fs = s.length >= 3 ? size * 0.72 : size;
+  const t = String(p);
+  const fs = t.length >= 3 ? size * 0.72 : size;
   ctx.font = `700 ${fs}px "Space Grotesk", system-ui, sans-serif`;
-  ctx.fillText(s, 32, 34);
+  if (outline) {
+    ctx.lineWidth = 5; ctx.lineJoin = 'round'; ctx.strokeStyle = outline;
+    ctx.strokeText(t, 32, y);
+  }
+  ctx.fillStyle = color;
+  ctx.fillText(t, 32, y);
 }
 
 function drawFavicon(p, charging, force) {
@@ -195,6 +205,25 @@ function drawFavicon(p, charging, force) {
     ctx.restore();
     label(p, p > 45 ? '#0d0b1f' : '#ffffff', 26);
     if (charging) bolt(54, 10, 16, '#ffffff');
+  } else if (style === 'horizontal') {
+    ctx.fillStyle = '#0d0b1f';
+    rr(0, 0, 64, 64, 16); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,.85)'; ctx.lineWidth = 3;
+    rr(5.5, 17.5, 47, 29, 7); ctx.stroke();            // battery body
+    ctx.fillStyle = 'rgba(255,255,255,.85)';
+    rr(54, 26, 5, 12, 2); ctx.fill();                  // terminal nub on the right
+    ctx.save();
+    rr(9, 21, 40, 22, 4); ctx.clip();
+    ctx.fillStyle = 'rgba(255,255,255,.1)';
+    ctx.fillRect(9, 21, 40, 22);
+    const fw = 40 * p / 100;                           // fills left to right
+    const hg = ctx.createLinearGradient(9, 0, 9 + Math.max(fw, 1), 0);
+    hg.addColorStop(0, a); hg.addColorStop(1, b);
+    ctx.fillStyle = hg;
+    ctx.fillRect(9, 21, fw, 22);
+    ctx.restore();
+    label(p, '#ffffff', 20, '#0d0b1f', 33);
+    if (charging) bolt(51, 9, 14, '#ffffff');
   } else {
     ctx.fillStyle = grad;
     rr(0, 0, 64, 64, 18); ctx.fill();
@@ -221,6 +250,45 @@ function fmt(sec) {
   return h ? `${h}h ${m}m` : `${m}m`;
 }
 
+// ---- Time estimate: shows instantly, then sharpens as your battery moves ----
+const SEED = {d: 12, c: 40};   // %/hour fallbacks until we've measured your real rate
+let samples = [], sampleMode = null, liveRate = null;
+try {
+  const o = JSON.parse(localStorage.getItem('bt-samples'));
+  if (o && Array.isArray(o.s)) { samples = o.s; sampleMode = o.c; }
+} catch (e) {}
+const rateKey = c => c ? 'bt-rate-c' : 'bt-rate-d';
+function savedRate(c) {
+  try { const v = +localStorage.getItem(rateKey(c)); if (v > 0) return v; } catch (e) {}
+  return c ? SEED.c : SEED.d;
+}
+function trackRate(level, charging) {
+  const now = Date.now();
+  const prev = samples[samples.length - 1];
+  if (sampleMode !== charging || (prev && now - prev.t > 40 * 60000)) { samples = []; liveRate = null; sampleMode = charging; }
+  const last = samples[samples.length - 1];
+  if (!last || last.level !== level) samples.push({t: now, level});
+  samples = samples.slice(-12);
+  try { localStorage.setItem('bt-samples', JSON.stringify({c: charging, s: samples})); } catch (e) {}
+  // the first sample is when we *noticed* a level, not when it began, so skip it once we can
+  const pts = samples.length >= 3 ? samples.slice(1) : samples;
+  if (pts.length >= 2) {
+    const a = pts[0], b = pts[pts.length - 1];
+    const hrs = (b.t - a.t) / 3600000;
+    const d = charging ? b.level - a.level : a.level - b.level;
+    if (hrs > 0 && d > 0) {
+      const r = d / hrs;
+      liveRate = samples.length >= 3 ? r : (r + savedRate(charging)) / 2;
+      try { localStorage.setItem(rateKey(charging), liveRate.toFixed(2)); } catch (e) {}
+    }
+  }
+}
+function estimateText(level, charging) {
+  const hrs = (charging ? 100 - level : level) / (liveRate || savedRate(charging));
+  if (!isFinite(hrs) || hrs <= 0) return '—';
+  return hrs > 24 ? '24h+' : '~' + fmt(hrs * 3600);
+}
+
 function render(level, charging, chargingTime, dischargingTime) {
   last = {level, charging};
   const [a, b] = palette(level);
@@ -233,7 +301,7 @@ function render(level, charging, chargingTime, dischargingTime) {
   $('state').innerHTML = charging ? '<span class="bolt">⚡</span> Charging' : (level <= 20 ? 'Running low' : 'On battery');
   $('stat').textContent = full && charging ? 'Fully charged' : (charging ? 'Plugged in' : 'Unplugged');
   $('tlabel').textContent = charging ? 'Until full' : 'Time left';
-  $('time').textContent = fmt(charging ? chargingTime : dischargingTime) || (full && charging ? 'Done' : 'Estimating…');
+  $('time').textContent = full && charging ? 'Done' : (fmt(charging ? chargingTime : dischargingTime) || estimateText(level, charging));
   document.title = `${charging ? '⚡' : '🔋'} ${level}% · BatteryTab`;
   drawFavicon(level, charging);
 }
@@ -300,6 +368,7 @@ function sync(bat) {
   if (key === lastKey) return;
   lastKey = key;
   lastChange = Date.now();
+  trackRate(level, bat.charging);
   render(level, bat.charging, bat.chargingTime, bat.dischargingTime);
   updateDiag();
 }
@@ -361,18 +430,32 @@ function startTicker(fn, ms) {
 
 // Self-heal for Chrome: after the tab was hidden (background tab, or another macOS desktop)
 // its Battery API connection can stay dead until a reload. So when you come back, reload once.
-function maybeRecover() {
-  if (!hasNative || bridgeUp || !hiddenAt || Date.now() - hiddenAt < 15000) return;
+let engaged = !document.hidden;  // true once this tab has actually been in front of you
+
+function reloadNow(guardMs) {
   try {
-    if (Date.now() - (+sessionStorage.getItem('bt-reload') || 0) < 20000) return;
+    if (Date.now() - (+sessionStorage.getItem('bt-reload') || 0) < guardMs) return false;
     sessionStorage.setItem('bt-reload', Date.now());
     if (last.level !== null) sessionStorage.setItem('bt-prev', last.level);
   } catch (e) {}
   location.reload();
+  return true;
+}
+
+function maybeRecover() {
+  if (!hasNative || bridgeUp || !hiddenAt || Date.now() - hiddenAt < 15000) return;
+  reloadNow(20000);
 }
 
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { hiddenAt = Date.now(); return; }
+  if (document.hidden) {
+    hiddenAt = Date.now();
+    // You just left the tab: reload it now, while it's out of sight, so tracking restarts fresh.
+    // (A reloaded tab starts out hidden, so this can't loop. Helper mode doesn't need it.)
+    if (engaged && hasNative && !bridgeUp) reloadNow(3000);
+    return;
+  }
+  engaged = true;
   maybeRecover();
   hiddenAt = 0;
   refresh().finally(updateDiag);
